@@ -13,6 +13,11 @@
 │   │                                   #   逐文件逐方法分析，聚焦知识图谱
 │   ├── 03-practice-guide.md            # 动手实践指南
 │   │                                   #   环境搭建 + Demo 运行说明
+│   ├── 04-alternatives-research.md     # 竞品调研（9大方案对比）
+│   ├── 05-openviking-deep-dive.md      # OpenViking 深度源码研究
+│   ├── 06-graphiti-deep-dive.md        # Zep/Graphiti 时序知识图谱研究
+│   ├── 07-benchmark-reproduction.md    # Benchmark 复现指南（991行）
+│   │                                   #   LoCoMo / LongMemEval / BEAM 实操
 │   └── mem0-paper.pdf                  # Mem0 论文原文
 │
 ├── demos/                              # 实践脚本
@@ -51,6 +56,11 @@
    - 环境搭建（uv + Python 3.12）
    - Demo 01: 原始记忆 CRUD
    - Demo 02: v3 完整流水线
+
+4. **[Benchmark 复现指南](docs/07-benchmark-reproduction.md)** — 复现实验结果
+   - LoCoMo / LongMemEval / BEAM 三大基准实操
+   - 环境搭建、数据获取、评估脚本、费用估算
+   - 竞品横向对比方法 + 结果记录模板
 
 ### 运行 Demo
 
