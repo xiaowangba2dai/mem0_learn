@@ -11,6 +11,7 @@
   - [硬件与软件要求](#硬件与软件要求)
   - [API Key 与费用估算](#api-key-与费用估算)
   - [环境搭建](#环境搭建)
+  - [自定义模型端点](#自定义模型端点)
 - [复现路线总览](#复现路线总览)
 - [LoCoMo 复现](#locomo-复现)
   - [数据集获取](#locomo-数据集获取)
@@ -116,6 +117,129 @@ uv pip install datasets            # HuggingFace 数据集加载
 
 # 4. 配置
 export OPENAI_API_KEY="sk-..."
+```
+
+### 自定义模型端点
+
+如果你使用国内代理、本地模型（Ollama/LM Studio/vLLM）或其他 OpenAI 兼容接口，需要在**三个地方**分别配置自定义 URL 和 API Key。
+
+#### 核心配置字段
+
+Mem0 的 `provider: "openai"` 支持任意 OpenAI 兼容端点，关键字段是 **`openai_base_url`**（注意：不是 `base_url`，带 `openai_` 前缀）。
+
+#### ① Mem0 本体（写入/检索记忆）
+
+```python
+from mem0 import Memory
+
+config = {
+    "llm": {
+        "provider": "openai",
+        "config": {
+            "model": "your-model-name",
+            "openai_base_url": "https://your-proxy.com/v1",
+            "api_key": "sk-your-key",
+            "temperature": 0,
+        }
+    },
+    "embedder": {
+        "provider": "openai",
+        "config": {
+            "model": "your-embedding-model",
+            "openai_base_url": "https://your-proxy.com/v1",
+            "api_key": "sk-your-key",
+        }
+    }
+}
+
+m = Memory.from_config(config)
+```
+
+常见兼容端点：
+
+| 服务 | `openai_base_url` 示例 | 备注 |
+|------|----------------------|------|
+| 国内代理 | `https://api.xxx.com/v1` | 按服务商文档填写 |
+| DeepSeek | `https://api.deepseek.com/v1` | 需 DeepSeek API Key |
+| SiliconFlow | `https://api.siliconflow.cn/v1` | 支持多种开源模型 |
+| Ollama（本地） | `http://localhost:11434/v1` | 无需 API Key，填任意值即可 |
+| LM Studio（本地） | `http://localhost:1234/v1` | 无需 API Key |
+| vLLM（本地） | `http://localhost:8000/v1` | 无需 API Key |
+| Azure OpenAI | 用 `provider: "azure_openai"` | 配置方式不同，见官方文档 |
+
+#### ② memory-benchmarks 评估框架
+
+评估框架通过 `configs/` 目录下的 YAML 文件配置：
+
+```yaml
+# configs/custom.yaml
+llm:
+  provider: openai
+  config:
+    model: "your-model"
+    openai_base_url: "https://your-proxy.com/v1"
+    api_key: "sk-your-key"
+    temperature: 0
+
+embedder:
+  provider: openai
+  config:
+    model: "your-embedding-model"
+    openai_base_url: "https://your-proxy.com/v1"
+    api_key: "sk-your-key"
+```
+
+运行时指定配置文件：
+
+```bash
+python benchmarks/locomo/run.py \
+  --backend oss \
+  --config configs/custom.yaml
+```
+
+#### ③ LLM Judge（评分脚本）
+
+评估脚本中的 LLM Judge 直接读取 OpenAI SDK 的环境变量：
+
+```bash
+# Linux / Mac
+export OPENAI_API_KEY="sk-your-key"
+export OPENAI_BASE_URL="https://your-proxy.com/v1"
+
+# Windows PowerShell
+$env:OPENAI_API_KEY = "sk-your-key"
+$env:OPENAI_BASE_URL = "https://your-proxy.com/v1"
+
+# 然后运行评分
+python benchmarks/locomo/evaluate.py --results-dir results/locomo/
+```
+
+#### 一条龙完整配置
+
+```bash
+# 1. 环境变量（给 Judge 评分脚本用）
+export OPENAI_API_KEY="sk-your-key"
+export OPENAI_BASE_URL="https://your-proxy.com/v1"
+
+# 2. 运行评估（Mem0 写入/检索，读取 configs/custom.yaml）
+python benchmarks/locomo/run.py --config configs/custom.yaml
+
+# 3. 评分（Judge 自动读取上面的环境变量）
+python benchmarks/locomo/evaluate.py --results-dir results/locomo/
+```
+
+```
+⚠️ 注意事项:
+
+  1. LLM Judge 对模型能力有要求
+     建议评分用 GPT-4o 级别的模型以保证评分质量
+     写入和检索可以用较便宜的模型（如 gpt-4o-mini 或同级替代品）
+
+  2. Embedding 模型和 LLM 可以分开配置
+     LLM 用代理，Embedding 用本地模型（或反过来）都可以
+
+  3. 本地模型（Ollama/LM Studio）不需要真实 API Key
+     但字段不能为空，填任意字符串即可: api_key: "not-needed"
 ```
 
 ---
@@ -292,11 +416,21 @@ from mem0 import Memory
 config = {
     "llm": {
         "provider": "openai",
-        "config": {"model": "gpt-4o-mini", "temperature": 0}
+        "config": {
+            "model": "gpt-4o-mini",
+            "temperature": 0,
+            # 自定义端点（可选，取消注释使用）:
+            # "openai_base_url": "https://your-proxy.com/v1",
+            # "api_key": "sk-your-key",
+        }
     },
     "embedder": {
         "provider": "openai",
-        "config": {"model": "text-embedding-3-small"}
+        "config": {
+            "model": "text-embedding-3-small",
+            # "openai_base_url": "https://your-proxy.com/v1",
+            # "api_key": "sk-your-key",
+        }
     }
 }
 m = Memory.from_config(config)
@@ -322,7 +456,11 @@ memories = m.search(question, user_id="locomo_conv_1", top_k=10)
 
 # 4. 用 LLM 生成答案
 from openai import OpenAI
-client = OpenAI()
+client = OpenAI(
+    # 自定义端点（可选，或读取 OPENAI_BASE_URL 环境变量）:
+    # base_url="https://your-proxy.com/v1",
+    # api_key="sk-your-key",
+)
 
 context = "\n".join([mem["memory"] for mem in memories["results"]])
 response = client.chat.completions.create(
