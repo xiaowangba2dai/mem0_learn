@@ -1,486 +1,325 @@
-# Memory-Core 多信号混合检索方案设计
+# Memory-Core 多信号混合检索实现设计
 
 更新时间：2026-07-01
 
-面向读者：
+本文是给 AI coding agent 执行实现用的设计文档，同时供人类研发评审。实现时以本文为主，遇到不明确处先读当前源码，再按本文的安全和契约原则做保守实现。
 
-- 主要读者：负责实现的 AI / 工程代理。
-- 次要读者：人类研发、评审、测试、运维。
+## 0. 执行摘要
 
-设计目标：
-
-- 在当前 memory-core 上实现一版参考 Mem0 思路的多信号混合检索。
-- 不推翻现有架构，不破坏现有 API 行为。
-- 优先保证安全可靠，其次保证可维护、可扩展和性能。
-
-参考资料：
-
-- Mem0 README：`https://github.com/mem0ai/mem0`
-- Mem0 README 中 2026-04 新算法说明：single-pass ADD-only extraction、entity linking、multi-signal retrieval、temporal reasoning。
-- Mem0 当前源码 `mem0/memory/main.py`：使用 `lemmatize_for_bm25`、`extract_entities`、BM25、entity boost、score fusion、rerank。
-- 当前 core 源码：
-  - `src/core/application/memory_search.py`
-  - `src/core/adapters/css_adapter.py`
-  - `src/core/ports/memory_vector_store.py`
-  - `src/core/domain/types/vector_operations.py`
-  - `src/core/api/router.py`
-  - `src/core/api/schemas.py`
-
-## 1. 总览
-
-### 1.1 当前 core 检索方式
-
-当前 search 链路：
+当前 memory-core 的记忆检索主要是：
 
 ```text
-POST /v1/core/internal/spaces/{space_id}/memories/search
-  -> API request 转 SearchFilters
-  -> MemorySearch.search()
-  -> EmbeddingService.embed(query)
-  -> MemoryVectorStoreService.search()
-  -> CSSAdapter.search()
-  -> OpenSearch KNN
-  -> min_score 过滤
-  -> optional RerankService.rerank()
-  -> top_k
+query -> embedding -> OpenSearch KNN -> optional rerank -> top_k
 ```
 
-当前优点：
-
-- 链路清晰。
-- 多租户隔离明确：OpenSearch 查询都带 `space_id` filter 和 routing。
-- 已有 metadata filter：strategy、actor、assistant、session、memory_type、time range。
-- 已有 rerank 降级逻辑。
-
-当前短板：
-
-- 召回信号单一，主要依赖 embedding。
-- 对项目代号、产品型号、人名、地点、短关键词不稳定。
-- 没有 BM25 / keyword 召回。
-- 没有实体信号。
-- 没有时间/新鲜度排序策略。
-- rerank 的候选来自单一路径，候选池本身可能漏掉关键记忆。
-
-### 1.2 目标检索方式
-
-目标 V1 链路：
+这对自然语言语义查询有效，但对项目代号、人名、地名、产品型号、短关键词不稳定。参考 Mem0 的多信号检索思路，本方案在当前 core 上实现 V1：
 
 ```text
-query
-  -> validate / normalize
-  -> parallel:
-       semantic vector search
-       keyword / BM25 search
-       entity-lite search
-  -> merge candidates by record_id
-  -> normalize each signal score
-  -> weighted score fusion
-  -> metadata / min_score / time policy filtering
-  -> optional rerank
-  -> stable final ranking
-  -> top_k
+semantic KNN
++ OpenSearch BM25 keyword
++ entity-lite exact/phrase boost
++ optional recency-lite
++ existing rerank
++ application-layer score fusion
 ```
 
-核心思想：
+V1 不做完整实体图谱，不改写入流程，不要求重建索引，不改变外部 response 结构。必须保留 vector-only fallback，并支持配置一键关闭 hybrid。
+
+## 1. Goal
+
+实现一版适用于当前 memory-core 的多信号混合检索，使 search 在保留现有语义检索能力的基础上，增强对精确词、代号、实体名的召回能力。
+
+目标能力：
+
+1. 同一个 search 请求并发执行 semantic vector recall 和 keyword recall。
+2. 从 query 中提取 lightweight keywords/entities，用于 keyword boost 和 fusion boost。
+3. 将多路候选按 memory id 合并，做分数归一化和加权融合。
+4. 在融合后的候选上执行现有 rerank，rerank 失败时回退到 fusion 排序。
+5. 所有召回路径都遵守当前 `space_id` routing、多租户过滤和 JWT 派生过滤。
+6. 所有新增能力都有配置开关、日志、降级路径和测试。
+
+## 2. Non-Goals
+
+本次不做：
+
+1. 不实现完整 entity index / graph memory。
+2. 不改 memory extraction / consolidation 写入策略。
+3. 不增加 LLM query rewrite。
+4. 不重建 OpenSearch index。
+5. 不改变 `/v1/core/internal/spaces/{space_id}/memories/search` 的 response schema。
+6. 不对普通调用方暴露 explain。
+7. 不引入外部中文分词服务。
+8. 不让 keyword/entity 召回绕过现有权限和 filter。
+
+## 3. Current System
+
+### 3.1 当前调用链
 
 ```text
-不要只问“这句话语义像不像？”
-还要问：
-  - 关键词有没有命中？
-  - 人名、地名、项目名、代号有没有命中？
-  - 这条记忆是不是更近、更适合当前问题？
-  - 多路信号综合后谁最可靠？
+src/core/api/router.py
+  search_memories()
+    -> to_search_filters()
+    -> MemorySearch.search()
+
+src/core/application/memory_search.py
+  MemorySearch.search()
+    -> EmbeddingService.embed()
+    -> MemoryVectorStoreService.search()
+    -> _apply_rerank_and_filter()
+
+src/core/application/services/memory_vector_store_service.py
+  search()
+    -> MemoryVectorStorePort.search()
+
+src/core/adapters/css_adapter.py
+  CSSAdapter.search()
+    -> OpenSearch knn query
 ```
 
-### 1.3 V1 范围
+### 3.2 当前安全边界
 
-V1 必做：
-
-1. 新增 hybrid search 应用服务编排。
-2. 在 vector store port 增加 keyword search / hybrid support 的契约。
-3. CSSAdapter 增加 OpenSearch BM25 查询。
-4. 增加候选合并、分数归一化、加权融合。
-5. 增加 entity-lite：不依赖新索引，先从 query 中提取关键 token / code / proper noun，并用于 keyword boost。
-6. 保留现有 API response，不强制外部 API 变更。
-7. 增加配置开关，支持一键回退到当前 vector-only。
-8. 增加安全、限流、降级、日志和指标设计。
-
-V1 不做：
-
-1. 不引入完整实体图谱。
-2. 不改变写入策略。
-3. 不改变 memory record 主体模型。
-4. 不要求重建 OpenSearch index。
-5. 不暴露调试分数给普通外部调用方。
-
-V1.1 / V2 再做：
-
-1. 独立 entity index。
-2. 中文 analyzer / ngram 子字段迁移。
-3. temporal fields：event_time、valid_from、valid_until、temporal_type。
-4. score explain API。
-5. query intent classifier：current / past / future / exact_lookup。
-
-## 2. 白盒要求落实
-
-### 2.1 安全可靠
-
-最高优先级。
-
-必须遵守：
-
-- 所有 search 查询必须始终带 `space_id` filter。
-- 所有 OpenSearch 查询必须始终带 `routing=str(space_id)`。
-- 用户可控字段不能拼接成 raw query string。
-- 不使用 OpenSearch `query_string` 处理用户输入。
-- keyword search 使用 `match`、`multi_match`、`term`、`bool` 等结构化 DSL。
-- query 长度、top_k、候选池大小必须有上限。
-- 任何单路召回失败都不能导致整体不可用，除非 semantic vector search 也失败且无可用降级。
-- 日志不能打印完整 query、完整 memory content、token、认证信息。
-- 多租户数据不能跨 `space_id`、actor、session 泄漏。
-- 错误返回不能包含底层连接串、认证信息、OpenSearch 原始异常细节。
-- 资源保护必须前置：限制 top_k、expansion_factor、keyword_candidate_limit、entity_candidate_limit。
-
-安全边界：
+当前 `CSSAdapter.search()` 已经具备几个必须保留的行为：
 
 ```text
-API 层：
-  校验 top_k / query / filters
-  JWT filter logic
-
-Application 层：
-  控制检索策略
-  控制候选池上限
-  控制降级
-
-VectorStore Adapter 层：
-  强制 space_id filter + routing
-  禁止无租户查询
-  结构化 OpenSearch DSL
+routing = str(space_id)
+query_filters includes {"term": {"space_id": routing}}
+filters.to_query_filters() appended
+_source excludes embedding
 ```
 
-### 2.2 代码整洁
+这些行为是多租户安全的底线。新增 keyword search 必须保持同样约束。
 
-要求：
+### 3.3 当前模型
 
-- 不把 hybrid 逻辑塞进 `MemorySearch` 一个大函数。
-- 不让 CSSAdapter 了解业务排序策略。
-- 不让 API schema 直接依赖 OpenSearch 细节。
-- 类型命名必须表达意图。
-- 每个模块只做一件事。
+当前 search 结果类型在：
 
-建议新增模块：
+```text
+src/core/domain/types/vector_operations.py
+```
+
+关键类型：
+
+```python
+SearchFilters
+SearchResult
+SearchResponse
+ListFilters
+ListResponse
+```
+
+当前 API response 转换在：
+
+```text
+src/core/api/schemas.py
+```
+
+`SearchResult.score` 会被映射到 API 的 `MemorySearchResult.score`。
+
+### 3.4 当前限制
+
+当前 vector-only 的典型失败场景：
+
+```text
+memory: 用户正在推进 XJ-91 项目，要求暂不公开。
+query: XJ-91 有什么注意事项？
+```
+
+`XJ-91` 是项目代号，embedding 语义不稳定。如果只有 KNN，可能召回“项目”“注意事项”相关但不包含 `XJ-91` 的记忆。
+
+## 4. Target Behavior
+
+### 4.1 V1 主流程
+
+```text
+MemorySearch.search(query, space_id, top_k, min_score, filters)
+  1. validate query / top_k
+  2. blank query -> existing list fallback
+  3. hybrid disabled -> existing vector-only path
+  4. QueryAnalyzer.analyze(query)
+  5. concurrently:
+       semantic recall
+       keyword recall
+  6. collect successful recall results
+  7. if all recall paths failed -> SearchError
+  8. merge candidates by record_id
+  9. compute semantic/keyword/entity/recency normalized scores
+ 10. compute fused score
+ 11. filter by effective min_score
+ 12. optional rerank top N candidates
+ 13. return top_k SearchResponse
+```
+
+### 4.2 Expected Example
+
+Data:
+
+```text
+m1: 用户正在推进 XJ-91 项目，要求暂不公开。
+m2: 用户关注向量检索性能优化。
+```
+
+Query:
+
+```text
+XJ-91 有什么注意事项？
+```
+
+Expected recall:
+
+```text
+semantic:
+  m2 score=0.82
+  m1 score=0.76
+
+keyword:
+  m1 score=12.4
+
+entity-lite:
+  m1 matches XJ-91
+```
+
+Expected final ranking:
+
+```text
+m1 first
+m2 lower or absent
+```
+
+### 4.3 Compatibility
+
+When `SEARCH_HYBRID_ENABLED=false`, behavior should match current vector-only search as closely as possible.
+
+When hybrid is enabled, API response shape remains unchanged:
+
+```json
+{
+  "results": [
+    {
+      "record": {},
+      "score": 0.73
+    }
+  ],
+  "total": 1,
+  "query": "..."
+}
+```
+
+For hybrid mode:
+
+- if rerank succeeds, score may represent rerank score or fused score depending on existing rerank return semantics;
+- if rerank is disabled or fails, score is fused score;
+- document this in code comments near score assignment.
+
+## 5. Architecture
+
+### 5.1 Module Layout
+
+Add:
 
 ```text
 src/core/application/search/
   __init__.py
-  hybrid_search.py
   query_analysis.py
   score_fusion.py
+  hybrid_search.py
   search_models.py
+```
 
+Modify:
+
+```text
+src/core/application/memory_search.py
+src/core/application/services/memory_vector_store_service.py
+src/core/ports/memory_vector_store.py
+src/core/adapters/css_adapter.py
+src/core/config.py
+```
+
+Optional:
+
+```text
 src/core/domain/types/search.py
-  或继续放在 vector_operations.py，但建议拆出 search.py
 ```
 
-推荐职责：
+If adding `domain/types/search.py` creates import churn, use `application/search/search_models.py` for V1 implementation-only models.
 
-- `HybridMemorySearch`：编排多路召回。
-- `QueryAnalyzer`：query normalize、entity-lite 提取、关键词提取。
-- `ScoreFusionService`：归一化、加权融合、排序。
-- `MemoryVectorStorePort`：定义存储层 search 契约。
-- `CSSAdapter`：只负责把契约翻译为 OpenSearch DSL。
+### 5.2 Responsibility Boundaries
 
-### 2.3 易扩展
+`MemorySearch`
 
-V1 要为后续扩展留接口：
+- Public use case class used by API.
+- Chooses vector-only or hybrid based on config.
+- Keeps blank-query list fallback.
 
-```text
-RecallSignal:
-  semantic
-  keyword
-  entity
-  temporal
-  rerank
-```
+`HybridMemorySearch`
 
-后续新增一种信号，不应该改 API 层，也不应该重写排序主流程，只新增：
+- Orchestrates query analysis, recall, fusion, rerank, fallback.
+- Does not know OpenSearch DSL.
 
-- 一个 retriever；
-- 一个 score normalizer；
-- 一个 weight 配置项。
+`QueryAnalyzer`
 
-### 2.4 高性能
+- Local deterministic query processing.
+- No LLM call.
+- Extracts normalized query, keywords, entity-like tokens, intent.
 
-要求：
+`ScoreFusionService`
 
-- 多路召回并发执行。
-- 每路召回有独立 timeout。
-- 候选池上限固定。
-- 避免跨 shard 查询：OpenSearch 必须使用 routing。
-- 避免拉 embedding 字段：`_source.excludes=["embedding"]`。
-- 避免无限 rerank：rerank 只对融合后的 top N 执行。
-- 避免重复结果重复 rerank：合并后去重。
+- Merges recall results.
+- Normalizes scores.
+- Applies weights.
+- Computes final fused scores.
 
-V1 默认候选规模建议：
+`MemoryVectorStoreService`
 
-```text
-top_k: 用户请求，默认 10，最大 100
-semantic_k: max(top_k * 4, 40)，最大 200
-keyword_k: max(top_k * 4, 40)，最大 200
-entity_k: max(top_k * 2, 20)，最大 100
-fusion_candidate_limit: 300
-rerank_candidate_limit: min(max(top_k * 3, 20), 80)
-```
+- Application service wrapper.
+- Adds `keyword_search()` as a pass-through.
 
-### 2.5 契约化
+`MemoryVectorStorePort`
 
-对外 API：
+- Storage contract.
+- Adds `keyword_search()` method.
 
-- V1 不改变现有 `/memories/search` response。
-- 新能力通过配置默认启用或灰度启用。
-- 可选增加 internal-only debug 参数，但默认不暴露。
+`CSSAdapter`
 
-内部契约：
+- Implements OpenSearch KNN and BM25 queries.
+- Must enforce routing and filters.
+- Must not implement fusion policy.
 
-- Port 返回 domain model，不返回 OpenSearch 原始 hit。
-- 分数融合输入输出有明确类型。
-- 降级行为可预测。
+## 6. Contracts
 
-### 2.6 可维护
-
-必须有：
-
-- 分阶段日志。
-- 每路召回耗时。
-- 每路候选数。
-- fusion 后候选数。
-- rerank 耗时。
-- 降级原因。
-- search trace id / request id。
-
-日志不包含完整 query 和完整 memory content，只记录长度、hash、数量、耗时。
-
-推荐日志事件：
-
-```text
-hybrid_search_start
-hybrid_search_query_analyzed
-hybrid_search_recall_completed
-hybrid_search_recall_failed
-hybrid_search_fusion_completed
-hybrid_search_rerank_completed
-hybrid_search_completed
-hybrid_search_degraded
-```
-
-## 3. 设计原则
-
-### 3.1 不破坏现有行为
-
-现有 vector-only 作为 fallback：
-
-```text
-SEARCH_HYBRID_ENABLED=false
-  -> 走当前 MemorySearch 逻辑
-```
-
-如果 hybrid 打开但 keyword/entity 失败：
-
-```text
-semantic 成功 -> 返回 semantic + rerank 结果
-semantic 失败、keyword 成功 -> 返回 keyword fusion 结果，标记 degraded
-semantic 和 keyword 都失败 -> 抛 SearchError
-```
-
-### 3.2 安全默认值
-
-默认：
-
-- 不返回 explain。
-- 不记录原文。
-- 不允许超大 top_k。
-- 不允许空 query 走 hybrid；空 query 仍走 list fallback。
-- 不允许跨 tenant 查询。
-
-### 3.3 多信号只提升召回，不绕过权限
-
-无论 semantic、keyword、entity 哪一路：
-
-```text
-space_id filter 必须有
-JWT 推导出的 actor/session/assistant filter 必须有
-strategy/memory_type/time filter 必须有
-routing 必须有
-```
-
-任何一路不得自己构造缺少权限条件的查询。
-
-## 4. 目标架构
-
-### 4.1 模块视图
-
-```text
-API Router
-  -> MemorySearchFacade
-      -> VectorOnlyMemorySearch       # 当前逻辑保留
-      -> HybridMemorySearch           # 新逻辑
-          -> QueryAnalyzer
-          -> EmbeddingService
-          -> MemoryVectorStoreService
-              -> MemoryVectorStorePort
-                  -> CSSAdapter
-          -> ScoreFusionService
-          -> RerankService
-```
-
-可选实现方式：
-
-1. 保持类名 `MemorySearch`，内部按 config 选择 vector-only 或 hybrid。
-2. 新增 `HybridMemorySearch`，由 dependencies 按配置注入。
-
-建议采用方式 2，但保留现有 `MemorySearch` 的 public contract。
-
-### 4.2 请求主流程
-
-```text
-MemorySearch.search(query, space_id, top_k, min_score, filters)
-  1. validate query
-  2. if blank -> list fallback
-  3. if hybrid disabled -> vector-only
-  4. analyze query
-  5. concurrently:
-       semantic recall
-       keyword recall
-       entity-lite recall
-  6. collect successful recall results
-  7. merge by memory_id
-  8. normalize scores per signal
-  9. calculate fused score
- 10. apply min_score policy
- 11. optional rerank on top N
- 12. return top_k
-```
-
-### 4.3 数据流示意
-
-输入：
-
-```json
-{
-  "query": "XJ-91 这个项目有什么注意事项？",
-  "top_k": 10,
-  "strategy_type": "semantic",
-  "actor_id": "u1"
-}
-```
-
-QueryAnalyzer 输出：
-
-```json
-{
-  "normalized_query": "XJ-91 这个项目有什么注意事项？",
-  "query_hash": "sha256:...",
-  "keywords": ["XJ-91", "项目", "注意事项"],
-  "entities": [
-    {"text": "XJ-91", "type": "code_or_identifier", "confidence": 1.0}
-  ],
-  "intent": "general"
-}
-```
-
-多路召回：
-
-```text
-semantic:
-  m2 score=0.82  content="用户关注向量检索性能..."
-  m7 score=0.79  content="XJ-91 暂不公开..."
-
-keyword:
-  m7 score=12.4  content="XJ-91 暂不公开..."
-
-entity-lite:
-  m7 score=1.0   entity_match="XJ-91"
-```
-
-融合：
-
-```text
-m7:
-  semantic_norm=0.79
-  keyword_norm=1.00
-  entity_norm=1.00
-  fused=0.89
-
-m2:
-  semantic_norm=0.82
-  keyword_norm=0
-  entity_norm=0
-  fused=0.45
-```
-
-最终：
-
-```text
-m7 排第一
-```
-
-## 5. Domain Model 设计
-
-### 5.1 新增 SearchSignal
-
-建议新增：
+### 6.1 SearchSignal
 
 ```python
 class SearchSignal(str, Enum):
     SEMANTIC = "semantic"
     KEYWORD = "keyword"
     ENTITY = "entity"
-    TEMPORAL = "temporal"
+    RECENCY = "recency"
     RERANK = "rerank"
 ```
 
-### 5.2 新增 RecallResult
+### 6.2 QueryEntity
 
 ```python
 @dataclass(frozen=True)
-class RecallResult:
-    result: SearchResult
-    signal: SearchSignal
-    raw_score: float
-    rank: int
-    matched_terms: tuple[str, ...] = ()
+class QueryEntity:
+    text: str
+    type: str
+    confidence: float
 ```
 
-说明：
+Supported V1 types:
 
-- `result` 是现有 SearchResult。
-- `signal` 表示来源。
-- `raw_score` 是该路原始分。
-- `rank` 是该路内部排名，从 1 开始。
-- `matched_terms` 只存短 token，不存完整 query。
-
-### 5.3 新增 HybridSearchCandidate
-
-```python
-@dataclass
-class HybridSearchCandidate:
-    result: SearchResult
-    signal_scores: dict[SearchSignal, float]
-    signal_ranks: dict[SearchSignal, int]
-    matched_terms: set[str]
-    fused_score: float = 0.0
-    rerank_score: float | None = None
+```text
+code_or_identifier
+email_or_handle
+date_like
+capitalized_name
+number
+plain_keyword
 ```
 
-说明：
-
-- 合并 key 是 `result.id`。
-- 同一个 memory 被多路召回时合并成一个 candidate。
-- `fused_score` 是 rerank 前排序分。
-- `rerank_score` 是 rerank 后分数。
-
-### 5.4 新增 QueryAnalysis
+### 6.3 QueryAnalysis
 
 ```python
 @dataclass(frozen=True)
@@ -492,45 +331,35 @@ class QueryAnalysis:
     intent: str = "general"
 ```
 
-### 5.5 新增 QueryEntity
+`query_hash` is for logs only. Use SHA-256 over normalized query with a short prefix for logging, for example first 12 hex chars. Do not log raw query.
+
+### 6.4 RecallResult
 
 ```python
 @dataclass(frozen=True)
-class QueryEntity:
-    text: str
-    type: str
-    confidence: float
+class RecallResult:
+    result: SearchResult
+    signal: SearchSignal
+    raw_score: float
+    rank: int
 ```
 
-V1 entity type：
-
-- `code_or_identifier`
-- `email_or_handle`
-- `date_like`
-- `capitalized_name`
-- `number`
-- `plain_keyword`
-
-## 6. Port 契约设计
-
-### 6.1 现有 Port
-
-当前：
+### 6.5 HybridSearchCandidate
 
 ```python
-async def search(
-    self,
-    space_id: UUID,
-    query_vector: list[float],
-    top_k: int = 10,
-    filters: SearchFilters | None = None,
-) -> SearchResponse:
-    ...
+@dataclass
+class HybridSearchCandidate:
+    result: SearchResult
+    signal_scores: dict[SearchSignal, float]
+    signal_ranks: dict[SearchSignal, int]
+    matched_entity_count: int = 0
+    fused_score: float = 0.0
+    rerank_score: float | None = None
 ```
 
-### 6.2 新增 keyword_search
+### 6.6 Port Contract
 
-建议在 `MemoryVectorStorePort` 增加：
+Add to `MemoryVectorStorePort`:
 
 ```python
 async def keyword_search(
@@ -541,601 +370,28 @@ async def keyword_search(
     filters: SearchFilters | None = None,
     boost_terms: list[str] | None = None,
 ) -> SearchResponse:
-    """Run BM25 / keyword search within the shared index, scoped to a space.
+    """Run BM25 / keyword search within a single tenant scope.
 
     Implementations MUST:
     - route by space_id
-    - filter by space_id
-    - apply all filters before scoring
-    - avoid raw query_string with user input
-    - exclude embedding from _source
+    - include a space_id filter
+    - apply all SearchFilters
+    - avoid query_string with user input
+    - exclude embedding from response source
     """
 ```
 
-### 6.3 新增 entity_search_lite
+Do not add `hybrid_search()` to the port in V1. Hybrid is application policy, not storage policy.
 
-V1 可以不在 Port 里单独加 entity method，而是在 keyword_search 里通过 `boost_terms` 实现。
+### 6.7 Config Contract
 
-如果要显式：
-
-```python
-async def entity_lite_search(
-    self,
-    space_id: UUID,
-    terms: list[str],
-    top_k: int = 10,
-    filters: SearchFilters | None = None,
-) -> SearchResponse:
-    ...
-```
-
-建议 V1 不增加这个 Port 方法，降低改动面。
-
-### 6.4 是否新增 hybrid_search 到 Port
-
-不建议 V1 在 Port 增加 `hybrid_search()`。
-
-原因：
-
-- hybrid 是应用层排序策略，不应该绑死到 OpenSearch。
-- 未来可能换 vector store 或增加 entity store。
-- 应用层更容易做降级、日志、权重配置。
-
-Port 只提供基础召回能力：
-
-```text
-semantic vector search
-keyword search
-get/list/write
-```
-
-## 7. CSSAdapter 设计
-
-### 7.1 当前索引可用字段
-
-当前 mapping：
-
-```json
-{
-  "embedding": "knn_vector",
-  "space_id": "keyword",
-  "content": "text",
-  "strategy_id": "keyword",
-  "strategy_type": "keyword",
-  "actor_id": "keyword",
-  "assistant_id": "keyword",
-  "session_id": "keyword",
-  "isolation_level": "keyword",
-  "memory_type": "keyword",
-  "created_at": "date",
-  "updated_at": "date"
-}
-```
-
-V1 可以直接对 `content` 做 `match` / `multi_match`，不需要重建索引。
-
-限制：
-
-- 默认 analyzer 对中文效果有限。
-- 对英文、数字、代号、空格分词较有效。
-- 对纯中文短 query 可能召回一般。
-
-### 7.2 keyword_search OpenSearch DSL
-
-禁止：
-
-```json
-{"query_string": {"query": "<user input>"}}
-```
-
-使用：
-
-```json
-{
-  "size": 40,
-  "query": {
-    "bool": {
-      "filter": [
-        {"term": {"space_id": "<space_id>"}},
-        "... filters ..."
-      ],
-      "must": [
-        {
-          "match": {
-            "content": {
-              "query": "<normalized_query>",
-              "operator": "or"
-            }
-          }
-        }
-      ],
-      "should": [
-        {"match_phrase": {"content": {"query": "XJ-91", "boost": 4.0}}},
-        {"match": {"content": {"query": "注意事项", "boost": 1.5}}}
-      ]
-    }
-  },
-  "_source": {"excludes": ["embedding"]}
-}
-```
-
-如果 `boost_terms` 为空：
-
-```json
-"should": []
-```
-
-如果 query 特别短，仍允许 match，但候选数受限。
-
-### 7.3 entity-lite boost
-
-QueryAnalyzer 提取：
-
-```text
-XJ-91
-JIRA-123
-user@example.com
-MaaS
-DeepSeek-V3.2
-```
-
-CSSAdapter keyword_search 把这些放进 `match_phrase should boost`：
-
-```json
-{
-  "match_phrase": {
-    "content": {
-      "query": "XJ-91",
-      "boost": 6.0
-    }
-  }
-}
-```
-
-注意：
-
-- boost term 数量限制，默认最多 8 个。
-- 单个 boost term 长度限制，默认最多 64 字符。
-- 不记录完整 boost term 到普通日志；仅记录 count 和类型分布。
-
-### 7.4 search response 解析
-
-复用 `_parse_search_response()`，但需要确认 score 来源：
-
-- KNN score 是向量相似分。
-- BM25 score 是文本相关分。
-
-两者不能直接比较，所以必须在应用层按 signal 归一化。
-
-## 8. QueryAnalyzer 设计
-
-### 8.1 职责
-
-`QueryAnalyzer` 只做轻量、本地、确定性处理：
-
-- trim。
-- 长度限制。
-- query hash。
-- keyword tokenize。
-- entity-lite extraction。
-- intent 粗分类。
-
-V1 不调用 LLM。
-
-原因：
-
-- search 是在线路径，不能引入额外 LLM 时延。
-- LLM query rewrite 有安全和稳定性风险。
-- 本地处理更容易做熔断和资源控制。
-
-### 8.2 输入校验
-
-规则：
-
-```text
-query must be str
-query.strip() must not be empty
-len(query) <= SEARCH_MAX_QUERY_LENGTH
-top_k <= SEARCH_MAX_TOP_K
-```
-
-如果超长：
-
-- API 层已有 max query length 时直接 400。
-- 如果历史 schema 没有限制，Application 层截断或拒绝。
-
-建议：
-
-- 对用户 API：超长返回 400。
-- 对内部兼容：可配置是否截断，默认拒绝。
-
-### 8.3 normalize
-
-V1 normalize：
-
-- strip。
-- 合并连续空白。
-- 保留原始大小写用于 exact phrase。
-- 生成 lowercase 版本用于 token 分析。
-
-不要做：
-
-- 删除标点导致项目代号变形。
-- 全角/半角复杂转换，除非有测试覆盖。
-
-### 8.4 keyword tokenize
-
-V1 简单规则：
-
-```text
-1. 提取 code-like token：
-   [A-Za-z]+[-_][A-Za-z0-9._-]+
-   [A-Za-z]{2,}[0-9]+
-   [A-Za-z0-9]{2,}[-_][A-Za-z0-9]{2,}
-
-2. 提取 email/handle/url-like token，注意不要记录敏感完整值到日志。
-
-3. 提取英文单词，过滤 stop words。
-
-4. 提取中文连续片段：
-   - V1 不做复杂分词。
-   - 长度 2-12 的连续中文片段可以作为 phrase。
-   - 更好的中文分词放 V1.1。
-```
-
-限制：
-
-```text
-max_keywords = 16
-max_keyword_length = 64
-```
-
-### 8.5 entity-lite extraction
-
-V1 entity-lite 不追求 NLP 完整性，只解决高价值场景：
-
-- 项目代号：`XJ-91`、`JIRA-123`。
-- 模型名：`deepseek-v3.2`、`bge-m3`。
-- 邮箱/账号：只用于检索，不记录明文日志。
-- 日期：`2026-07-01`、`next Friday` 先只作为 keyword。
-- 英文大写实体：`Stanford`、`Tokyo`。
-
-输出：
-
-```python
-QueryEntity(text="XJ-91", type="code_or_identifier", confidence=1.0)
-```
-
-安全：
-
-- entity text 可能包含敏感信息。
-- 日志只记录 entity_count 和 entity_types。
-
-### 8.6 intent 粗分类
-
-V1 可选：
-
-```text
-current:
-  现在 / current / currently / latest / now
-
-past:
-  之前 / 以前 / last time / before / previously
-
-future:
-  接下来 / 明天 / 下周 / upcoming / next
-
-general:
-  default
-```
-
-V1 只用于轻量 recency boost，不改变过滤结果。
-
-## 9. 多路召回设计
-
-### 9.1 Semantic Recall
-
-复用当前：
-
-```text
-embedding_service.embed(query)
-memory_vector_store_service.search(space_id, vector, semantic_k, filters)
-```
-
-候选数：
-
-```python
-semantic_k = min(
-    max(top_k * semantic_expansion_factor, min_semantic_candidates),
-    max_semantic_candidates,
-)
-```
-
-默认：
-
-```text
-semantic_expansion_factor=4
-min_semantic_candidates=40
-max_semantic_candidates=200
-```
-
-超时：
-
-```text
-embedding_timeout_ms
-vector_search_timeout_ms
-```
-
-失败：
-
-- embedding 失败：semantic recall 失败。
-- 如果 keyword recall 成功，可以 degraded 返回。
-- 如果所有 recall 失败，抛 SearchError。
-
-### 9.2 Keyword Recall
-
-新增：
-
-```text
-memory_vector_store_service.keyword_search(
-  space_id=space_id,
-  query=analysis.normalized_query,
-  top_k=keyword_k,
-  filters=filters,
-  boost_terms=analysis.keywords + entity texts
-)
-```
-
-候选数：
-
-```text
-keyword_k = min(max(top_k * 4, 40), 200)
-```
-
-适用：
-
-- 项目代号。
-- 精确词。
-- 人名。
-- 地名。
-- 产品名。
-- 关键词表达。
-
-失败：
-
-- keyword search 失败时记录 degraded。
-- 不影响 semantic recall。
-
-### 9.3 Entity-Lite Recall
-
-V1 不单独访问 entity store。
-
-实现方式：
-
-```text
-entity terms -> keyword_search boost_terms
-```
-
-同时在 fusion 阶段给命中 entity terms 的候选额外 entity score。
-
-如何判断候选命中 entity：
-
-- 不做复杂高亮。
-- CSSAdapter 可通过 OpenSearch highlight 返回 matched snippets，但 V1 不建议引入。
-- 应用层可以对候选 content 做大小写不敏感的 substring check。
-
-安全：
-
-- 只在内存中做 substring。
-- 不记录 content。
-- entity term 数量和长度受限。
-
-entity score：
-
-```python
-entity_score = matched_entity_count / total_entity_count
-```
-
-或：
-
-```python
-entity_score = max(confidence for matched entity)
-```
-
-建议 V1：
-
-```text
-entity_score = min(1.0, matched_entity_count / max(1, total_entity_count))
-```
-
-### 9.4 Temporal / Recency Signal
-
-V1 没有 event_time，只能使用 `created_at` / `updated_at`。
-
-不做强排序，只做小权重 boost。
-
-规则：
-
-```text
-intent=current/general:
-  新记忆轻微加分
-
-intent=past:
-  不加新鲜度 boost，避免误伤历史问题
-
-intent=future:
-  V1 暂不做，因为没有 event_time
-```
-
-recency score：
-
-```text
-age_days <= 1      -> 1.00
-age_days <= 7      -> 0.80
-age_days <= 30     -> 0.50
-age_days <= 180    -> 0.20
-else               -> 0.00
-```
-
-权重必须小，默认 0.05-0.10。
-
-原因：
-
-- created_at 是写入时间，不一定是事实发生时间。
-- 不能让新但无关的记忆盖过旧但准确的记忆。
-
-## 10. Score Fusion 设计
-
-### 10.1 为什么不能直接相加
-
-不同分数尺度不同：
-
-- KNN score：通常 0-1 或类似范围。
-- BM25 score：可能 0-几十。
-- Entity score：0-1。
-- Recency score：0-1。
-- Rerank score：模型自定义范围。
-
-所以必须归一化。
-
-### 10.2 归一化方案
-
-V1 推荐 rank-based + min-max 混合。
-
-对 semantic：
-
-```python
-semantic_norm = clamp(raw_score, 0.0, 1.0)
-```
-
-如果实际 OpenSearch KNN score 不在 0-1，则使用 per-list min-max：
-
-```python
-norm = (score - min_score) / (max_score - min_score)
-```
-
-对 keyword：
-
-```python
-keyword_norm = per-list min-max
-```
-
-如果该路只有一个结果：
-
-```python
-keyword_norm = 1.0
-```
-
-对 rank fallback：
-
-```python
-rank_norm = 1 / (rank + rank_constant)
-```
-
-默认 `rank_constant=1`。
-
-### 10.3 权重
-
-默认权重建议：
-
-```text
-semantic_weight = 0.55
-keyword_weight  = 0.25
-entity_weight   = 0.15
-recency_weight  = 0.05
-```
-
-如果 query 中存在强 entity/code token：
-
-```text
-semantic_weight = 0.45
-keyword_weight  = 0.30
-entity_weight   = 0.20
-recency_weight  = 0.05
-```
-
-如果 query 很长、没有实体：
-
-```text
-semantic_weight = 0.65
-keyword_weight  = 0.20
-entity_weight   = 0.05
-recency_weight  = 0.10
-```
-
-V1 可以先固定一套权重，不做动态权重；但代码结构要支持动态。
-
-### 10.4 融合公式
-
-```python
-fused_score = (
-    semantic_weight * semantic_norm
-    + keyword_weight * keyword_norm
-    + entity_weight * entity_norm
-    + recency_weight * recency_norm
-)
-```
-
-缺失信号按 0 处理。
-
-### 10.5 min_score 策略
-
-现有 `min_score` 是 vector similarity 分数。
-
-Hybrid 后需要重新定义。
-
-V1 兼容方案：
-
-- 如果 hybrid disabled：保持现有语义。
-- 如果 hybrid enabled：
-  - `min_score` 应用于 `fused_score`。
-  - 默认 `SEARCH_DEFAULT_MIN_SCORE` 需要重新调低，例如 `0.35`。
-
-为了避免破坏现有调用，建议新增配置：
-
-```text
-SEARCH_HYBRID_DEFAULT_MIN_SCORE=0.30
-SEARCH_VECTOR_DEFAULT_MIN_SCORE=0.75
-```
-
-API request 里传入 `min_score` 时：
-
-- 解释为当前 search mode 的 score。
-- 文档要明确。
-
-### 10.6 Rerank 后排序
-
-如果 rerank enabled：
-
-流程：
-
-```text
-fusion candidates sorted by fused_score
-  -> take rerank_candidate_limit
-  -> rerank(query, candidates)
-  -> final sort by rerank score
-  -> top_k
-```
-
-如果 rerank 失败：
-
-```text
-fallback to fused_score ranking
-```
-
-不要 rerank 所有候选，避免成本过高。
-
-## 11. 配置设计
-
-在 `SearchConfig` 增加：
+Add to `SearchConfig`:
 
 ```python
 hybrid_enabled: bool = True
-
-hybrid_semantic_enabled: bool = True
 hybrid_keyword_enabled: bool = True
 hybrid_entity_lite_enabled: bool = True
-hybrid_recency_enabled: bool = True
+hybrid_recency_enabled: bool = False
 
 hybrid_semantic_weight: float = 0.55
 hybrid_keyword_weight: float = 0.25
@@ -1162,668 +418,326 @@ hybrid_max_term_length: int = 64
 hybrid_default_min_score: float = 0.30
 ```
 
-权重校验：
+Validation:
 
-```text
-每个权重 >= 0
-总权重 > 0
-建议总和约等于 1，但不要强依赖
+- all weights must be `>= 0`;
+- total weight must be `> 0`;
+- candidate limits must be bounded, with hard maximum no higher than 500 for V1;
+- timeouts must be positive and below total `search_timeout_ms`.
+
+## 7. Security Requirements
+
+Security is the first priority. Do not trade tenant isolation or input safety for recall quality.
+
+### 7.1 Multi-Tenant Isolation
+
+Every storage query path must include:
+
+```python
+routing = str(space_id)
+query_filters = [{"term": {"space_id": routing}}]
+query_filters.extend(filters.to_query_filters())
 ```
 
-候选数校验：
+This applies to:
 
-```text
-max candidates <= 500
-timeout <= reasonable upper bound
-```
+- semantic KNN search;
+- keyword search;
+- any future entity search;
+- list fallback remains unchanged.
 
-## 12. API 设计
+Tests must prove:
 
-### 12.1 V1 不改公开响应
+1. Data in `space_a` is not returned for `space_b`.
+2. Same `space_id` but different `actor_id` / `session_id` respects filters.
+3. JWT-derived filters from API are still applied.
 
-现有 response：
+### 7.2 Query Injection Prevention
+
+Do not use OpenSearch `query_string` or raw string query composition with user input.
+
+Forbidden:
 
 ```json
-{
-  "results": [
-    {
-      "record": {...},
-      "score": 0.82
-    }
-  ],
-  "total": 1,
-  "query": "..."
-}
+{"query_string": {"query": "<user query>"}}
 ```
 
-V1 中 `score` 返回：
+Allowed:
 
-- hybrid enabled 且 rerank disabled：`fused_score`。
-- hybrid enabled 且 rerank enabled：优先返回 rerank 后 score；如果 rerank service 返回的是重排后的原 SearchResult score，则需要统一处理。
-- vector-only：保持原 score。
-
-为避免语义混乱，建议 domain SearchResult 增加可选字段前先不改 API schema，内部用 candidate 分数覆盖最终 SearchResult.score。
-
-### 12.2 Debug Explain
-
-V1 不对普通 API 开放。
-
-可以后续增加 internal-only：
-
-```http
-POST /v1/core/internal/spaces/{space_id}/memories/search:explain
+```json
+{"match": {"content": {"query": "<user query>", "operator": "or"}}}
 ```
 
-或 header：
+Allowed:
+
+```json
+{"match_phrase": {"content": {"query": "<boost term>", "boost": 4.0}}}
+```
+
+Reason: `query_string` interprets user input as syntax. `match` treats input as analyzed text.
+
+### 7.3 Sensitive Data Logging
+
+Do not log:
+
+- raw query;
+- raw memory content;
+- full matched terms if they may include personal data;
+- JWT;
+- API keys;
+- Maas tokens;
+- OpenSearch credentials;
+- request/response body from OpenSearch.
+
+Allowed logs:
 
 ```text
-X-Debug-Search-Explain: true
-```
-
-但必须：
-
-- 仅内部环境可用。
-- 需要 internal token。
-- 不返回敏感 content 片段。
-- explain 里只返回分数、signal、rank、matched_terms 的脱敏版本。
-
-V1 文档先预留，不实现。
-
-## 13. 安全设计细节
-
-### 13.1 多租户隔离
-
-每一路召回都必须：
-
-```python
-query_filters = [{"term": {"space_id": str(space_id)}}]
-query_filters.extend(filters.to_query_filters())
-client.search(..., routing=str(space_id))
-```
-
-禁止：
-
-- keyword_search 忘记 routing。
-- entity search 使用全局 index 无 space filter。
-- debug explain 返回其他 tenant 信息。
-
-测试必须覆盖：
-
-- 两个 space 写入相似内容，只能查到当前 space。
-- 同 space 不同 actor/session，根据 JWT filter 只能查到允许范围。
-
-### 13.2 注入攻击防护
-
-OpenSearch DSL 使用结构化查询。
-
-禁止：
-
-```python
-{"query_string": {"query": user_query}}
-```
-
-允许：
-
-```python
-{"match": {"content": {"query": user_query}}}
-```
-
-原因：
-
-- query_string 支持特殊语法，容易被用户输入影响查询结构。
-- match 把用户输入作为文本分析，不作为 DSL。
-
-### 13.3 敏感数据保护
-
-日志禁止：
-
-- 完整 query。
-- 完整 memory content。
-- access token。
-- auth token。
-- API key。
-- OpenSearch password。
-- JWT。
-
-日志允许：
-
-```text
+space_id
 query_length
 query_hash
 top_k
-space_id
 strategy_type
-actor/session 是否存在
-candidate counts
+has_actor_filter
+has_session_filter
+semantic_count
+keyword_count
+candidate_count
 duration_ms
-degraded reason code
+degraded_reason
 ```
 
-matched_terms：
+### 7.4 Resource Protection
 
-- 默认不打日志。
-- debug explain 中需要脱敏。
+Enforce limits before remote calls:
 
-### 13.4 资源保护
+- query length <= `max_query_length`;
+- top_k <= `max_top_k`;
+- keyword count <= `hybrid_max_keywords`;
+- entity count <= `hybrid_max_entities`;
+- term length <= `hybrid_max_term_length`;
+- fusion candidates <= `hybrid_max_fusion_candidates`;
+- rerank candidates <= `hybrid_rerank_candidate_limit`.
 
-限制：
+If limits are exceeded:
 
-- `max_query_length`
-- `max_top_k`
-- `max_keywords`
-- `max_entities`
-- `max_term_length`
-- `max_fusion_candidates`
-- `rerank_candidate_limit`
+- reject invalid user request where existing API semantics support rejection;
+- truncate internal keyword/entity lists safely;
+- log only counts, not raw values.
 
-超限行为：
+### 7.5 External Error Handling
 
-- query/top_k 超限：返回 400 或按现有 schema 校验。
-- keywords/entities 超限：截断，记录 count。
-- OpenSearch timeout：该路降级。
-
-### 13.5 错误容错
-
-错误分类：
+Single recall path failure must degrade when possible:
 
 ```text
-semantic_error:
-  embedding failure
-  vector search failure
-
-keyword_error:
-  OpenSearch keyword search failure
-
-entity_error:
-  query analysis failure
-
-fusion_error:
-  local scoring bug
-
-rerank_error:
-  rerank service failure
+semantic ok, keyword fail -> return semantic-based results, degraded=true
+semantic fail, keyword ok -> return keyword-based results, degraded=true
+semantic fail, keyword fail -> SearchError
+rerank fail -> return fusion ranking
 ```
 
-降级策略：
+Never expose raw OpenSearch exceptions to API callers.
+
+## 8. Performance Requirements
+
+### 8.1 Concurrency
+
+Semantic and keyword recall should run concurrently.
+
+Use `asyncio.gather(..., return_exceptions=True)` or an equivalent helper. Do not serialize:
 
 ```text
-semantic ok, keyword fail:
-  return semantic-based hybrid degraded
-
-semantic fail, keyword ok:
-  return keyword-based degraded
-
-semantic fail, keyword fail:
-  raise SearchError
-
-rerank fail:
-  return fusion ranking
+semantic recall -> wait -> keyword recall
 ```
 
-### 13.6 自愈
+### 8.2 Candidate Limits
 
-可自愈手段：
+Default:
 
-- 单路失败自动降级。
-- OpenSearch transient error 交给 adapter / service retry 策略。
-- timeout 后不阻塞整体。
-- config 可一键关闭 hybrid。
-- readiness 不因 keyword path 单次失败变 down，但指标应体现 degraded。
+```text
+semantic_k = min(max(top_k * 4, 40), 200)
+keyword_k = min(max(top_k * 4, 40), 200)
+fusion_candidate_limit = 300
+rerank_candidate_limit = min(max(top_k * 3, 20), 80)
+```
 
-## 14. 性能设计细节
+### 8.3 OpenSearch Efficiency
 
-### 14.1 并发执行
+All OpenSearch queries must:
 
-使用 `asyncio.gather(..., return_exceptions=True)` 或结构化 helper。
+- use `routing=str(space_id)`;
+- include `space_id` filter;
+- exclude `embedding` from `_source`;
+- use bounded `size`;
+- avoid all-shard fan-out.
 
-伪代码：
+### 8.4 Rerank Efficiency
+
+Rerank only the top fused candidates, never all raw candidates.
+
+```text
+fusion top N -> rerank -> final top_k
+```
+
+### 8.5 Timeouts
+
+Apply per-path timeouts:
+
+```text
+semantic vector search timeout
+keyword search timeout
+rerank timeout
+```
+
+Timeout should degrade a path rather than blocking the full request beyond `search_timeout_ms`.
+
+## 9. Query Analysis
+
+### 9.1 Rules
+
+`QueryAnalyzer` must be deterministic and local. Do not call LLM.
+
+Steps:
+
+1. Trim query.
+2. Collapse repeated whitespace.
+3. Preserve original casing for phrase search.
+4. Generate `query_hash`.
+5. Extract keywords.
+6. Extract entity-like terms.
+7. Classify rough intent.
+
+### 9.2 Keyword Extraction
+
+Extract:
+
+- code-like tokens: `XJ-91`, `JIRA-123`, `deepseek-v3.2`, `bge-m3`;
+- email or handle-like tokens, but never log raw values;
+- English words excluding a small stopword set;
+- short Chinese phrases as fallback, without advanced segmentation in V1.
+
+Limits:
+
+```text
+max_keywords = 16
+max_keyword_length = 64
+```
+
+### 9.3 Entity-Lite Extraction
+
+V1 entity-lite only supports simple high-value patterns:
+
+```text
+code_or_identifier: XJ-91, JIRA-123, deepseek-v3.2
+email_or_handle: user@example.com, @someone
+date_like: 2026-07-01
+capitalized_name: Tokyo, Stanford
+number: 12345
+```
+
+No external NLP dependency.
+
+### 9.4 Intent
+
+Optional V1 rough intent:
+
+```text
+current: 现在, currently, latest, now
+past: 以前, 之前, before, previously
+future: 明天, 下周, upcoming, next
+general: default
+```
+
+V1 only uses intent for small recency behavior. If uncertain, return `general`.
+
+## 10. Recall Design
+
+### 10.1 Semantic Recall
+
+Use existing embedding and vector search:
 
 ```python
-semantic_task = create_task(self._semantic_recall(...))
-keyword_task = create_task(self._keyword_recall(...))
-
-results = await gather_with_timeout([
-    ("semantic", semantic_task),
-    ("keyword", keyword_task),
-])
+vector = await embedding_service.embed(query)
+response = await vector_store.search(space_id, vector.values, top_k=semantic_k, filters=filters)
 ```
 
-不要串行：
-
-```text
-vector search 完了再 keyword search
-```
-
-### 14.2 超时控制
-
-每一路独立 timeout：
+Convert to:
 
 ```python
-await asyncio.wait_for(keyword_search(), timeout=keyword_timeout)
+RecallResult(signal=SearchSignal.SEMANTIC, raw_score=result.score, rank=i + 1)
 ```
 
-总 search timeout：
+### 10.2 Keyword Recall
 
-- 可以复用现有 `search_timeout_ms`。
-- 单路 timeout 不能超过总 timeout。
-
-### 14.3 网络和 shard 优化
-
-OpenSearch 查询：
-
-- 必须 routing。
-- 必须 filter space_id。
-- `_source` exclude embedding。
-- size 控制。
-
-这能避免：
-
-- 全 shard fan-out。
-- 大字段返回。
-- 跨租户扫描。
-
-### 14.4 Rerank 成本控制
-
-Rerank 只处理融合后的前 N：
-
-```text
-N = min(max(top_k * 3, 20), hybrid_rerank_candidate_limit)
-```
-
-不要：
-
-```text
-semantic 200 + keyword 200 全部 rerank
-```
-
-### 14.5 内存控制
-
-候选合并用 dict：
+Use new storage method:
 
 ```python
-candidates: dict[UUID, HybridSearchCandidate]
-```
-
-最大条数：
-
-```text
-hybrid_max_fusion_candidates
-```
-
-超出时：
-
-- 先按每路 rank 截断。
-- 再融合。
-
-## 15. 实现步骤
-
-### 15.1 Step 1：新增类型
-
-新增文件建议：
-
-```text
-src/core/domain/types/search.py
-```
-
-放入：
-
-- `SearchSignal`
-- `RecallResult`
-- `HybridSearchCandidate`
-- `QueryAnalysis`
-- `QueryEntity`
-
-如果项目倾向少文件，也可先放入 `vector_operations.py`，但长期建议拆出。
-
-### 15.2 Step 2：扩展 Port 和 Service
-
-修改：
-
-```text
-src/core/ports/memory_vector_store.py
-src/core/application/services/memory_vector_store_service.py
-```
-
-新增：
-
-```python
-async def keyword_search(...)
-```
-
-Service 只转发，不做 OpenSearch 细节。
-
-### 15.3 Step 3：CSSAdapter 实现 keyword_search
-
-修改：
-
-```text
-src/core/adapters/css_adapter.py
-```
-
-要求：
-
-- `_require_index_ready()`
-- routing。
-- space_id filter。
-- filters.to_query_filters()。
-- match / match_phrase DSL。
-- `_source.excludes=["embedding"]`。
-- SearchError 包装。
-- parse response 复用。
-
-### 15.4 Step 4：QueryAnalyzer
-
-新增：
-
-```text
-src/core/application/search/query_analysis.py
-```
-
-实现：
-
-- validate。
-- normalize。
-- hash。
-- keywords。
-- entity-lite。
-- intent。
-
-必须有单元测试覆盖：
-
-- 空 query。
-- 超长 query。
-- `XJ-91`。
-- `deepseek-v3.2`。
-- 中文 query。
-- 包含换行和特殊符号 query。
-
-### 15.5 Step 5：ScoreFusionService
-
-新增：
-
-```text
-src/core/application/search/score_fusion.py
-```
-
-实现：
-
-- merge recall results。
-- normalize per signal。
-- entity score。
-- recency score。
-- fused score。
-- sort。
-
-必须有单元测试覆盖：
-
-- 单 semantic。
-- semantic + keyword。
-- keyword 高分覆盖语义弱相关。
-- entity boost。
-- 缺失信号。
-- 空候选。
-
-### 15.6 Step 6：HybridMemorySearch
-
-新增：
-
-```text
-src/core/application/search/hybrid_search.py
-```
-
-或修改现有：
-
-```text
-src/core/application/memory_search.py
-```
-
-建议：
-
-- 保留现有 `MemorySearch` 为 facade。
-- 新增 `VectorMemorySearch` 和 `HybridMemorySearch`。
-
-第一版也可以少改：
-
-```text
-MemorySearch.search()
-  if config.hybrid_enabled:
-      return await self._hybrid_search(...)
-  return await self._vector_search(...)
-```
-
-但函数不要过长。
-
-### 15.7 Step 7：配置接入
-
-修改：
-
-```text
-src/core/config.py
-.env
-```
-
-加 hybrid 配置。
-
-默认建议：
-
-```text
-SEARCH_HYBRID_ENABLED=true
-SEARCH_HYBRID_KEYWORD_ENABLED=true
-SEARCH_HYBRID_ENTITY_LITE_ENABLED=true
-SEARCH_HYBRID_RECENCY_ENABLED=false
-```
-
-V1 可以先关闭 recency，避免 created_at 引起误排序；测试稳定后打开。
-
-### 15.8 Step 8：日志和指标
-
-日志：
-
-```python
-logger.info(
-    "hybrid_search_completed",
-    space_id=str(space_id),
-    query_length=len(query),
-    query_hash=analysis.query_hash,
-    top_k=top_k,
-    semantic_count=len(semantic_results),
-    keyword_count=len(keyword_results),
-    candidate_count=len(candidates),
-    result_count=len(results),
-    degraded=degraded,
-    duration_ms=duration,
+response = await vector_store.keyword_search(
+    space_id=space_id,
+    query=analysis.normalized_query,
+    top_k=keyword_k,
+    filters=filters,
+    boost_terms=boost_terms,
 )
 ```
 
-不要打：
+`boost_terms`:
 
 ```text
-query
-content
-raw OpenSearch body
+analysis.keywords + [entity.text for entity in analysis.entities]
 ```
 
-指标建议：
+Then limit and sanitize according to config.
+
+### 10.3 Entity-Lite Signal
+
+No separate OpenSearch query in V1.
+
+Compute entity score during fusion by checking whether candidate content contains entity text.
+
+Rules:
+
+- case-insensitive for ASCII terms;
+- exact substring match only;
+- entity terms limited before use;
+- do not log candidate content or raw entity term by default.
+
+### 10.4 Recency-Lite Signal
+
+Default disabled in V1: `SEARCH_HYBRID_RECENCY_ENABLED=false`.
+
+If enabled:
 
 ```text
-memory_search_hybrid_duration_ms
-memory_search_semantic_recall_duration_ms
-memory_search_keyword_recall_duration_ms
-memory_search_fusion_duration_ms
-memory_search_rerank_duration_ms
-memory_search_degraded_total
-memory_search_candidates_total
+intent=past -> recency_score = 0
+intent=general/current -> small boost based on created_at
+intent=future -> no special boost until event_time exists
 ```
 
-### 15.9 Step 9：测试
-
-单元测试：
-
-- QueryAnalyzer。
-- ScoreFusionService。
-- CSSAdapter keyword DSL 构造。
-- MemorySearch 降级。
-
-集成测试：
-
-- 写入几条 memory，分别测试 vector-only / keyword / hybrid。
-- 两个 space 隔离。
-- actor/session filter。
-- keyword path failure fallback。
-- rerank failure fallback。
-
-性能测试：
-
-- top_k=10。
-- top_k=100。
-- query 包含 16 个 keywords。
-- 多租户并发。
-
-安全测试：
-
-- query 包含 OpenSearch query_string 特殊字符：
+Suggested scores:
 
 ```text
-*) OR *:* OR content:*
+age <= 1 day    -> 1.00
+age <= 7 days   -> 0.80
+age <= 30 days  -> 0.50
+age <= 180 days -> 0.20
+else            -> 0.00
 ```
 
-预期：
+Keep weight small, default `0.05`.
 
-- 不越权。
-- 不报原始 DSL 错误。
-- 不返回其他 tenant 数据。
+## 11. CSSAdapter Keyword Search
 
-## 16. 伪代码
+### 11.1 DSL
 
-### 16.1 HybridMemorySearch
-
-```python
-class HybridMemorySearch:
-    async def search(self, query, space_id, top_k, min_score, filters):
-        effective_query = self._validate_query(query)
-        analysis = self._query_analyzer.analyze(effective_query)
-
-        semantic_task = asyncio.create_task(
-            self._semantic_recall(analysis, space_id, top_k, filters)
-        )
-        keyword_task = asyncio.create_task(
-            self._keyword_recall(analysis, space_id, top_k, filters)
-        )
-
-        recall_results = []
-        degraded_reasons = []
-
-        for signal, task in await collect_tasks(...):
-            if task.failed:
-                degraded_reasons.append(signal)
-                continue
-            recall_results.extend(task.results)
-
-        if not recall_results:
-            raise SearchError("all recall paths failed", space_id=space_id)
-
-        candidates = self._fusion.merge_and_score(
-            analysis=analysis,
-            recalls=recall_results,
-            min_score=effective_min_score,
-        )
-
-        rerank_input = candidates[:self._config.hybrid_rerank_candidate_limit]
-        final_results = await self._rerank_or_fallback(effective_query, rerank_input)
-
-        return SearchResponse(
-            results=final_results[:top_k],
-            total=min(len(final_results), top_k),
-        )
-```
-
-### 16.2 Keyword Recall
-
-```python
-async def _keyword_recall(self, analysis, space_id, top_k, filters):
-    keyword_k = self._compute_keyword_k(top_k)
-    boost_terms = list(analysis.keywords)
-    boost_terms.extend(entity.text for entity in analysis.entities)
-    boost_terms = limit_terms(boost_terms)
-
-    response = await self._vector_store.keyword_search(
-        space_id=space_id,
-        query=analysis.normalized_query,
-        top_k=keyword_k,
-        filters=filters,
-        boost_terms=boost_terms,
-    )
-
-    return [
-        RecallResult(
-            result=r,
-            signal=SearchSignal.KEYWORD,
-            raw_score=r.score,
-            rank=i + 1,
-        )
-        for i, r in enumerate(response.results)
-    ]
-```
-
-### 16.3 Score Fusion
-
-```python
-def merge_and_score(self, analysis, recalls, min_score):
-    by_id = {}
-
-    grouped = group_by_signal(recalls)
-    normalized = normalize_scores(grouped)
-
-    for recall in recalls:
-        candidate = by_id.setdefault(
-            recall.result.id,
-            HybridSearchCandidate(result=recall.result, ...)
-        )
-        candidate.signal_scores[recall.signal] = normalized[recall]
-        candidate.signal_ranks[recall.signal] = recall.rank
-
-    for candidate in by_id.values():
-        candidate.signal_scores[SearchSignal.ENTITY] = compute_entity_score(
-            candidate.result.content,
-            analysis.entities,
-        )
-        candidate.signal_scores[SearchSignal.TEMPORAL] = compute_recency_score(
-            candidate.result.created_at,
-            analysis.intent,
-        )
-        candidate.fused_score = weighted_sum(candidate.signal_scores)
-
-    results = [
-        c for c in by_id.values()
-        if c.fused_score >= min_score
-    ]
-    return sorted(results, key=lambda c: (-c.fused_score, c.result.created_at))
-```
-
-## 17. OpenSearch DSL 细节
-
-### 17.1 KNN 保持现状
-
-现有 CSSAdapter.search 已经做对：
-
-- `_require_index_ready`
-- `space_id` filter
-- routing
-- excludes embedding
-
-保持。
-
-### 17.2 Keyword Search DSL
-
-示例：
+Implement using structured OpenSearch DSL:
 
 ```python
 query_filters = [{"term": {"space_id": routing}}]
-if filters:
+if filters is not None:
     query_filters.extend(filters.to_query_filters())
 
 should_clauses = []
-for term in boost_terms[:max_boost_terms]:
+for term in boost_terms:
     should_clauses.append({
         "match_phrase": {
             "content": {
@@ -1855,318 +769,732 @@ body = {
 }
 ```
 
-### 17.3 空 keyword 处理
+Call:
 
-如果 query analysis 没有关键词：
-
-- 仍可用 normalized query 做 match。
-- 如果 normalized query 太短且没有有效 token，可以跳过 keyword recall。
-
-规则：
-
-```text
-len(normalized_query) < 2 and no entity -> skip keyword
+```python
+await self._client.search(index=self._index_name, body=body, routing=routing)
 ```
 
-## 18. 例子
+### 11.2 Empty Keyword Behavior
 
-### 18.1 项目代号
+If normalized query is valid but extracted keywords are empty, keyword search can still run with `match` on normalized query.
 
-记忆：
-
-```text
-m1: 用户正在推进 XJ-91 项目，要求暂不公开。
-m2: 用户关注向量检索性能优化。
-```
-
-查询：
+Skip keyword recall only when:
 
 ```text
-XJ-91 有什么注意事项？
+len(normalized_query) < 2 and no entity-like terms
 ```
 
-Vector-only 风险：
+### 11.3 Errors
 
-- `XJ-91` 没有稳定语义。
-- 可能召回 m2。
+Wrap OpenSearch errors:
 
-Hybrid：
+```python
+raise SearchError(f"Keyword search failed on index {self._index_name}: {exc}", space_id=space_id)
+```
+
+Do not include query text in the error.
+
+## 12. Score Fusion
+
+### 12.1 Merge
+
+Merge by `SearchResult.id`.
+
+If same id appears in multiple recall paths:
+
+- preserve one `SearchResult`;
+- store each path score under its `SearchSignal`;
+- preserve best rank per signal.
+
+### 12.2 Normalize
+
+Do not directly add KNN and BM25 raw scores.
+
+Semantic:
+
+- if scores are already in `[0, 1]`, clamp to `[0, 1]`;
+- otherwise use per-list min-max.
+
+Keyword:
+
+- use per-list min-max;
+- if single keyword result, normalized score is `1.0`.
+
+Entity:
+
+```python
+entity_norm = matched_entity_count / max(1, total_entity_count)
+entity_norm = min(1.0, entity_norm)
+```
+
+Recency:
+
+- use recency score from section 10.4.
+
+### 12.3 Weights
+
+Default:
 
 ```text
-semantic:
-  m2=0.82
-  m1=0.76
-
-keyword:
-  m1=10.3
-
-entity:
-  m1 matches XJ-91
-
-fusion:
-  m1 > m2
+semantic_weight = 0.55
+keyword_weight  = 0.25
+entity_weight   = 0.15
+recency_weight  = 0.05
 ```
 
-### 18.2 用户偏好
+Formula:
 
-记忆：
+```python
+fused_score = (
+    semantic_weight * semantic_norm
+    + keyword_weight * keyword_norm
+    + entity_weight * entity_norm
+    + recency_weight * recency_norm
+)
+```
+
+Missing signal = 0.
+
+### 12.4 Min Score
+
+Hybrid mode uses `hybrid_default_min_score` when request `min_score` is not set.
+
+Vector-only mode keeps current `default_min_score`.
+
+If caller explicitly passes `min_score`, interpret it according to active mode. Add a code comment because this differs from vector-only semantics.
+
+### 12.5 Stable Sorting
+
+Sort by:
 
 ```text
-m1: 用户是素食者。
-m2: 用户对坚果过敏。
-m3: 用户希望回答简短。
+fused_score desc
+then best signal rank asc
+then updated_at desc
+then id asc
 ```
 
-查询：
+Keep tie-breaking deterministic for tests.
+
+## 13. Rerank
+
+Use existing `RerankService`.
+
+Input candidates:
 
 ```text
-我有什么饮食限制？
+top min(max(top_k * 3, 20), hybrid_rerank_candidate_limit) by fused_score
 ```
 
-Hybrid：
+If rerank succeeds:
 
-- semantic 命中 m1/m2。
-- keyword 可能弱。
-- entity 无明显强信号。
-- 最终 semantic 主导。
+- return reranked order;
+- keep result count bounded by `top_k`.
 
-说明：
+If rerank fails:
 
-Hybrid 不会牺牲普通语义查询。
+- log `hybrid_search_rerank_failed`;
+- return fusion order.
 
-### 18.3 中文短词
+Do not call rerank with raw candidates from all recall paths before fusion.
 
-记忆：
+## 14. Failure And Degradation
+
+### 14.1 Degradation Matrix
+
+| Semantic | Keyword | Rerank | Behavior |
+|---|---|---|---|
+| success | success | success | full hybrid |
+| success | success | fail | fusion fallback |
+| success | fail | any | semantic degraded |
+| fail | success | any | keyword degraded |
+| fail | fail | any | SearchError |
+
+### 14.2 Degraded Logging
+
+Log:
 
 ```text
-m1: 用户的女儿叫 Emma，正在申请 Stanford。
-m2: 用户同事叫 Emily，负责预算。
+hybrid_search_degraded
+reason=keyword_failed | semantic_failed | rerank_failed | timeout
+query_hash
+space_id
 ```
 
-查询：
+Do not log raw query.
+
+### 14.3 Fallback Switch
+
+If hybrid causes production issue:
 
 ```text
-Emma 申请哪所学校？
+SEARCH_HYBRID_ENABLED=false
 ```
 
-Hybrid：
+should restore current vector-only behavior without code rollback.
 
-- entity-lite 提取 `Emma`。
-- keyword boost 命中 m1。
-- semantic 命中 m1。
-- m1 排前。
+## 15. Observability
 
-### 18.4 历史问题
+### 15.1 Logs
 
-记忆：
+Required events:
 
 ```text
-m1: 用户 2025 年住在上海。
-m2: 用户 2026 年搬到杭州。
+hybrid_search_start
+hybrid_search_query_analyzed
+hybrid_search_recall_completed
+hybrid_search_recall_failed
+hybrid_search_fusion_completed
+hybrid_search_rerank_completed
+hybrid_search_degraded
+hybrid_search_completed
 ```
 
-查询：
+Recommended fields:
 
 ```text
-我以前住在哪里？
+space_id
+query_hash
+query_length
+top_k
+strategy_type
+has_actor_filter
+has_session_filter
+semantic_count
+keyword_count
+candidate_count
+result_count
+duration_ms
+degraded
 ```
 
-V1：
+### 15.2 Metrics
 
-- intent=past。
-- 不启用 recency boost。
-- 靠 semantic/keyword/rerank。
-
-未来 V2：
-
-- 使用 event_time 和 temporal_type。
-- past query boost 过去事件。
-
-## 19. 与 Mem0 的对应关系
-
-| Mem0 能力 | 当前 V1 设计 | 说明 |
-|---|---|---|
-| semantic retrieval | semantic vector search | 复用当前 KNN |
-| BM25 keyword | keyword_search | 新增 CSSAdapter BM25 |
-| entity matching | entity-lite boost | V1 不建 entity index |
-| score fusion | ScoreFusionService | 应用层融合 |
-| rerank | RerankService | 复用当前能力 |
-| temporal reasoning | recency-lite | V1 只做轻量新鲜度 |
-| ADD-only extraction | 不在本方案范围 | 属于写入策略 |
-
-## 20. 风险和取舍
-
-### 20.1 中文 BM25 效果风险
-
-当前 `content` 是默认 text analyzer，对中文分词可能一般。
-
-V1 取舍：
-
-- 先实现 keyword recall，对英文、代号、混合 token 立即有收益。
-- 中文更好的分词放 V1.1。
-
-V1.1 方案：
-
-- 增加 `content.ngram` 子字段。
-- 或接入中文 analyzer。
-- 需要 index migration。
-
-### 20.2 分数阈值语义变化
-
-Hybrid score 和 vector score 不同。
-
-处理：
-
-- hybrid 使用独立 default min score。
-- 文档说明。
-- 如果用户显式传 min_score，按当前 mode 解释。
-
-### 20.3 Rerank 分数不统一
-
-RerankService 可能返回重排结果，但分数含义和 fused score 不一致。
-
-处理：
-
-- 最终 SearchResult.score 可以设置为 rerank score。
-- 如果 rerank 不提供稳定分数，则保留 fused_score，只用 rerank 顺序调整。
-- 需要看当前 RerankService 返回结构后实现。
-
-### 20.4 keyword 召回噪声
-
-BM25 可能召回关键词相同但语义不相关的记忆。
-
-处理：
-
-- fusion 中 keyword 权重不超过 semantic。
-- rerank 打开时能二次过滤。
-- min_score 控制。
-
-### 20.5 性能风险
-
-多一路 OpenSearch 查询会增加延迟。
-
-处理：
-
-- 并发执行。
-- routing 限 shard。
-- timeout。
-- 候选上限。
-- keyword 可配置关闭。
-
-## 21. 验收标准
-
-### 21.1 功能验收
-
-必须满足：
-
-- hybrid enabled 时 search 正常返回。
-- hybrid disabled 时行为等价当前 vector-only。
-- 项目代号类 query 能通过 keyword/entity-lite 提升召回。
-- 普通语义 query 不明显退化。
-- rerank 失败时仍返回 fusion 排序。
-- keyword 失败时仍返回 semantic 排序。
-
-### 21.2 安全验收
-
-必须满足：
-
-- 不跨 space。
-- 不跨 actor/session。
-- 不使用 query_string。
-- 日志无完整 query/content/token。
-- top_k/query length 超限受控。
-- OpenSearch 异常不泄漏连接信息。
-
-### 21.3 性能验收
-
-建议目标：
+If metrics infra is available, add:
 
 ```text
-top_k=10:
-  hybrid p50 <= vector-only p50 + 50ms + keyword query cost
-  hybrid p95 不因 keyword timeout 无限放大
-
-keyword path timeout:
-  整体仍在 search_timeout_ms 内返回 degraded
-
-rerank enabled:
-  rerank candidates <= configured limit
+memory_search_hybrid_duration_ms
+memory_search_semantic_recall_duration_ms
+memory_search_keyword_recall_duration_ms
+memory_search_fusion_duration_ms
+memory_search_rerank_duration_ms
+memory_search_degraded_total
+memory_search_candidates_total
 ```
 
-### 21.4 可观测验收
+If metrics infra is not ready, logs are mandatory and metrics can be follow-up.
 
-必须能从日志判断：
+## 16. Implementation Plan
 
-- 本次是否 hybrid。
-- 每路召回数量。
-- 每路耗时。
-- 是否 degraded。
-- fusion candidate 数。
-- rerank 是否成功。
+### Step 1: Add Models
 
-## 22. 推荐提交拆分
-
-建议按以下 PR / commit 拆：
-
-1. `search types + config`
-2. `vector store keyword_search contract`
-3. `css keyword_search implementation`
-4. `query analyzer`
-5. `score fusion`
-6. `hybrid memory search orchestration`
-7. `tests + docs`
-
-不要把所有改动压成一个大提交。
-
-## 23. 第一版实现重点
-
-实现 AI 应优先完成：
-
-1. 保留 vector-only fallback。
-2. 确保所有 keyword 查询都带 routing 和 filters。
-3. 不使用 query_string。
-4. 实现 ScoreFusionService 的单元测试。
-5. 实现两个集成级场景：
-   - `XJ-91` 项目代号召回。
-   - 两个 space 隔离。
-6. 加日志但不泄漏 query/content。
-
-不要第一版就做：
-
-- 实体图谱。
-- LLM query rewrite。
-- 大规模 index migration。
-- 对外 explain API。
-
-## 24. 最终推荐
-
-第一版多信号混合检索应采用：
+Create:
 
 ```text
-semantic KNN
-+ OpenSearch BM25 keyword
-+ entity-lite exact/phrase boost
-+ optional recency-lite
-+ existing rerank
-+ application-layer score fusion
+src/core/application/search/search_models.py
 ```
 
-这版方案能在当前 core 上低风险落地，且能补上最明显的召回短板：
+Add:
 
-- 项目代号。
-- 人名地名。
-- 产品型号。
-- 精确关键词。
-- embedding 漏召回。
+- `SearchSignal`
+- `QueryEntity`
+- `QueryAnalysis`
+- `RecallResult`
+- `HybridSearchCandidate`
 
-等 V1 稳定后，再演进到：
+Keep these dependency-light. Avoid importing adapters.
+
+### Step 2: Add QueryAnalyzer
+
+Create:
 
 ```text
-entity index
-content ngram / Chinese analyzer
-temporal fields
-search explain
-strategy-aware search policy
+src/core/application/search/query_analysis.py
 ```
 
-这样既参考了 Mem0 的先进方向，又不会破坏 memory-core 当前多策略、强隔离、可配置的工程基础。
+Implement:
+
+```python
+class QueryAnalyzer:
+    def __init__(self, config: SearchConfig) -> None: ...
+    def analyze(self, query: str) -> QueryAnalysis: ...
+```
+
+Tests:
+
+- empty query rejected or handled before analyzer;
+- whitespace collapse;
+- `XJ-91`;
+- `deepseek-v3.2`;
+- Chinese query;
+- query with `*) OR *:*`;
+- max keywords/entities enforced.
+
+### Step 3: Add ScoreFusionService
+
+Create:
+
+```text
+src/core/application/search/score_fusion.py
+```
+
+Implement:
+
+```python
+class ScoreFusionService:
+    def merge_and_score(
+        self,
+        analysis: QueryAnalysis,
+        recalls: list[RecallResult],
+        min_score: float,
+    ) -> list[HybridSearchCandidate]:
+        ...
+```
+
+Tests:
+
+- semantic only;
+- keyword only;
+- semantic + keyword same id;
+- entity boost;
+- min_score filtering;
+- deterministic tie-break.
+
+### Step 4: Extend Port
+
+Modify:
+
+```text
+src/core/ports/memory_vector_store.py
+src/core/application/services/memory_vector_store_service.py
+```
+
+Add `keyword_search()`.
+
+Service method should pass through to port. No DSL in service.
+
+### Step 5: Implement CSSAdapter.keyword_search
+
+Modify:
+
+```text
+src/core/adapters/css_adapter.py
+```
+
+Requirements:
+
+- `_require_index_ready()`;
+- routing;
+- `space_id` filter;
+- `filters.to_query_filters()`;
+- `match` / `match_phrase`;
+- no `query_string`;
+- exclude `embedding`;
+- `SearchError` wrapper;
+- parse via existing `_parse_search_response()`.
+
+Tests should assert generated query shape if helper extraction is feasible. If not, use integration-style test with a fake client capturing body.
+
+### Step 6: Add HybridMemorySearch
+
+Create:
+
+```text
+src/core/application/search/hybrid_search.py
+```
+
+Implement:
+
+```python
+class HybridMemorySearch:
+    async def search(
+        self,
+        query: str,
+        space_id: UUID,
+        top_k: int,
+        min_score: float | None,
+        filters: SearchFilters | None,
+    ) -> SearchResponse:
+        ...
+```
+
+This class receives:
+
+- `EmbeddingService`
+- `MemoryVectorStoreService`
+- `RerankService`
+- `SearchConfig`
+- `QueryAnalyzer`
+- `ScoreFusionService`
+
+### Step 7: Wire MemorySearch Facade
+
+Modify:
+
+```text
+src/core/application/memory_search.py
+```
+
+Options:
+
+1. Make existing `MemorySearch` call hybrid branch when enabled.
+2. Or make `MemorySearch` a facade delegating to `VectorMemorySearch` / `HybridMemorySearch`.
+
+Prefer minimal safe change:
+
+```python
+if self._config.hybrid_enabled:
+    return await self._hybrid_search(...)
+return await self._vector_search(...)
+```
+
+But keep helper methods small.
+
+### Step 8: Add Config
+
+Modify:
+
+```text
+src/core/config.py
+.env
+```
+
+Default:
+
+```text
+SEARCH_HYBRID_ENABLED=true
+SEARCH_HYBRID_KEYWORD_ENABLED=true
+SEARCH_HYBRID_ENTITY_LITE_ENABLED=true
+SEARCH_HYBRID_RECENCY_ENABLED=false
+```
+
+If production risk is high, set `SEARCH_HYBRID_ENABLED=false` in `.env` and enable only for testing.
+
+### Step 9: Add Tests
+
+Add unit tests for:
+
+- QueryAnalyzer;
+- ScoreFusionService;
+- CSSAdapter keyword_search body;
+- HybridMemorySearch degradation.
+
+Add integration/behavior tests for:
+
+- `XJ-91` exact token improves ranking;
+- hybrid disabled equals vector-only path;
+- keyword failure falls back to semantic;
+- rerank failure falls back to fusion;
+- two-space tenant isolation.
+
+## 17. Pseudocode
+
+### 17.1 Hybrid Search
+
+```python
+async def search(self, query, space_id, top_k, min_score, filters):
+    analysis = self._query_analyzer.analyze(query)
+    effective_min_score = self._effective_min_score(min_score)
+
+    tasks = {
+        SearchSignal.SEMANTIC: asyncio.create_task(
+            self._semantic_recall(analysis, space_id, top_k, filters)
+        )
+    }
+    if self._config.hybrid_keyword_enabled:
+        tasks[SearchSignal.KEYWORD] = asyncio.create_task(
+            self._keyword_recall(analysis, space_id, top_k, filters)
+        )
+
+    recalls = []
+    degraded_reasons = []
+    for signal, task in tasks.items():
+        try:
+            recalls.extend(await task)
+        except Exception as exc:
+            degraded_reasons.append(signal.value)
+            logger.warning("hybrid_search_recall_failed", signal=signal.value, exc_info=True)
+
+    if not recalls:
+        raise SearchError("all recall paths failed", space_id=space_id)
+
+    candidates = self._fusion.merge_and_score(analysis, recalls, effective_min_score)
+    final_results = await self._rerank_or_fallback(query, candidates, top_k)
+    return SearchResponse(results=final_results[:top_k], total=len(final_results[:top_k]))
+```
+
+### 17.2 Semantic Recall
+
+```python
+async def _semantic_recall(self, analysis, space_id, top_k, filters):
+    vector = await self._embedding_service.embed(analysis.normalized_query)
+    response = await self._vector_store.search(
+        space_id,
+        vector.values,
+        top_k=self._semantic_k(top_k),
+        filters=filters,
+    )
+    return [
+        RecallResult(result=r, signal=SearchSignal.SEMANTIC, raw_score=r.score, rank=i + 1)
+        for i, r in enumerate(response.results)
+    ]
+```
+
+### 17.3 Keyword Recall
+
+```python
+async def _keyword_recall(self, analysis, space_id, top_k, filters):
+    boost_terms = list(analysis.keywords)
+    boost_terms.extend(entity.text for entity in analysis.entities)
+    boost_terms = self._limit_terms(boost_terms)
+
+    response = await self._vector_store.keyword_search(
+        space_id,
+        analysis.normalized_query,
+        top_k=self._keyword_k(top_k),
+        filters=filters,
+        boost_terms=boost_terms,
+    )
+    return [
+        RecallResult(result=r, signal=SearchSignal.KEYWORD, raw_score=r.score, rank=i + 1)
+        for i, r in enumerate(response.results)
+    ]
+```
+
+## 18. Test Plan
+
+### 18.1 Unit Tests
+
+`QueryAnalyzer`
+
+- `XJ-91 有什么注意事项` extracts `XJ-91`.
+- `deepseek-v3.2` extracts model-like identifier.
+- malicious-looking query does not throw and is not interpreted as DSL.
+- keyword/entity limits are enforced.
+- raw query is not included in log fields.
+
+`ScoreFusionService`
+
+- semantic-only candidate gets score.
+- keyword-only candidate gets score.
+- candidate present in both paths ranks above equivalent single-signal candidate.
+- entity match increases score.
+- min_score filters low candidates.
+- sorting is deterministic.
+
+`CSSAdapter.keyword_search`
+
+- includes routing.
+- includes `space_id` filter.
+- includes provided filters.
+- excludes `embedding`.
+- uses `match` / `match_phrase`.
+- does not use `query_string`.
+
+`HybridMemorySearch`
+
+- semantic success + keyword failure returns semantic degraded.
+- semantic failure + keyword success returns keyword degraded.
+- both fail raises SearchError.
+- rerank failure returns fusion order.
+
+### 18.2 Integration Tests
+
+Use a small test index or fake adapter.
+
+Case 1: exact token
+
+```text
+memory A: 用户正在推进 XJ-91 项目，要求暂不公开。
+memory B: 用户关注向量检索性能优化。
+query: XJ-91 有什么注意事项？
+expected: A ranked first
+```
+
+Case 2: tenant isolation
+
+```text
+space A memory: XJ-91 secret
+space B memory: XJ-91 public
+query in space A
+expected: only space A memory
+```
+
+Case 3: actor/session filters
+
+```text
+same space, different actor/session
+expected: search respects filters
+```
+
+Case 4: fallback switch
+
+```text
+SEARCH_HYBRID_ENABLED=false
+expected: keyword_search not called
+```
+
+### 18.3 Security Tests
+
+Queries:
+
+```text
+*) OR *:* OR content:*
+content:(secret)
+" OR "1"="1
+```
+
+Expected:
+
+- no raw query_string DSL;
+- no cross-tenant results;
+- no OpenSearch syntax error leaked to caller;
+- no raw query/content in logs.
+
+### 18.4 Performance Tests
+
+Measure:
+
+- vector-only p50/p95;
+- hybrid p50/p95;
+- keyword recall duration;
+- fusion duration;
+- rerank duration;
+- candidate counts.
+
+Validate:
+
+- top_k=10 and top_k=100 stay within configured limits;
+- keyword timeout degrades and does not block total request;
+- rerank candidate count <= configured limit.
+
+## 19. Acceptance Criteria
+
+Functional:
+
+- Hybrid search returns valid `SearchResponse`.
+- Hybrid disabled preserves current vector-only behavior.
+- Keyword recall improves exact-token scenario.
+- Rerank failure does not fail whole search.
+- Keyword recall failure does not fail whole search if semantic succeeds.
+
+Security:
+
+- Every recall path uses `space_id` filter and routing.
+- No `query_string` with user input.
+- No raw query/content/token in logs.
+- Tenant and actor/session isolation tests pass.
+
+Performance:
+
+- Candidate counts are bounded.
+- Rerank input is bounded.
+- Per-path timeout works.
+- No embedding field returned from OpenSearch search source.
+
+Maintainability:
+
+- Fusion logic is unit tested separately.
+- Query analysis is unit tested separately.
+- CSSAdapter does not contain application-level fusion policy.
+- Config names are explicit and documented.
+
+Operational:
+
+- Logs show recall counts, durations, degraded reason.
+- `SEARCH_HYBRID_ENABLED=false` is a safe rollback.
+
+## 20. Rollout And Rollback
+
+### 20.1 Rollout
+
+Recommended sequence:
+
+1. Merge code with `SEARCH_HYBRID_ENABLED=false`.
+2. Run unit and integration tests.
+3. Enable in staging.
+4. Run exact-token benchmark and normal semantic benchmark.
+5. Check logs for degraded rate and latency.
+6. Enable in production with small traffic or controlled environment.
+
+### 20.2 Rollback
+
+Immediate rollback:
+
+```text
+SEARCH_HYBRID_ENABLED=false
+```
+
+No index rollback should be required in V1.
+
+## 21. Recommended Commit Split
+
+1. `search models and config`
+2. `query analyzer`
+3. `score fusion service`
+4. `vector store keyword search contract`
+5. `css keyword search implementation`
+6. `hybrid search orchestration`
+7. `tests and docs`
+
+Avoid one giant commit.
+
+## 22. Implementation Notes For AI Agent
+
+When implementing:
+
+1. Read current files before editing.
+2. Keep changes scoped to search path.
+3. Preserve public API response schema.
+4. Prefer small classes with explicit names.
+5. Add tests before or alongside behavior changes.
+6. Never remove existing vector-only code path.
+7. Never weaken routing/filter logic.
+8. Never log raw query or memory content.
+9. Use existing project logging style.
+10. If a design point conflicts with existing code, preserve security and compatibility first.
+
+## 23. Future Work
+
+After V1 is stable:
+
+1. Add `content.keyword` / `content.ngram` / Chinese analyzer through index migration.
+2. Add entity index:
+
+```text
+entity -> linked_memory_ids
+```
+
+3. Add temporal fields:
+
+```text
+event_time
+valid_from
+valid_until
+temporal_type
+```
+
+4. Add internal-only search explain.
+5. Add strategy-aware retrieval policy.
+6. Add offline evaluation set for memory search quality.
+
+## 24. Source Basis
+
+This design is based on:
+
+- Current memory-core search implementation.
+- Mem0 public direction: semantic + BM25 + entity matching + score fusion + rerank.
+- Agent instruction best practices: clear goal, non-goals, contracts, safety constraints, implementation steps, tests, acceptance criteria.
+
+Primary local files:
+
+```text
+src/core/application/memory_search.py
+src/core/adapters/css_adapter.py
+src/core/ports/memory_vector_store.py
+src/core/domain/types/vector_operations.py
+src/core/api/router.py
+src/core/api/schemas.py
+src/core/config.py
+```
